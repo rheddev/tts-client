@@ -1,117 +1,136 @@
-import { useEffect, useState } from 'react';
-import './index.css';
+import React, { useState, useEffect, useCallback } from "react";
+import "./index.css";
+import { Queue } from "./Queue";
 
-interface TTSMessage {
-    name: string;
-    amount: number;
-    message: string;
-    id: number;
+interface Message {
+  name: string;
+  amount: number;
+  message: string;
 }
 
-const formatAmount = (amount: number): string => {
-    return new Intl.NumberFormat('en-US', {
-        style: 'currency',
-        currency: 'USD',
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-    }).format(amount);
-};
+export const TTSServer: React.FC = () => {
+  const [messageQueue] = useState(() => new Queue<Message>());
+  const [error, setError] = useState<string | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [isInitialized, setIsInitialized] = useState(false);
+  const [displayMessage, setDisplayMessage] = useState<Message | null>(null);
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
-async function streamAudio(text: string) {
-    try {
-        const response = await fetch('https://play.ht/api/v2/tts/stream', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${import.meta.env.VITE_PLAYHT_API_KEY}`,
-                'X-User-ID': import.meta.env.VITE_PLAYHT_USER_ID,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                text,
-                voice: 'en-US-JennyNeural',
-                output_format: 'mp3',
-                quality: 'high',
-                speed: 1,
-                sample_rate: 24000,
-            })
-        });
+  const speakMessage = useCallback((message: Message) => {
+    const text = `${message.name} donated ${message.amount} dollars and said: ${message.message}`;
 
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
 
-        const blob = await response.blob();
-        const audio = new Audio(URL.createObjectURL(blob));
-        audio.play();
-    } catch (error) {
-        console.error('Error streaming audio:', error);
+    utterance.onstart = () => {
+      setDisplayMessage(message);
+      setIsSpeaking(true);
+      console.log('Started speaking:', text);
+    };
+    
+    window.speechSynthesis.speak(utterance);
+
+    utterance.onend = () => {
+      setDisplayMessage(null);
+      setIsSpeaking(false);
+      messageQueue.dequeue(); // Remove the message after speaking
+      console.log('Finished speaking:', text);
+    };
+  }, [messageQueue]);
+
+  const processQueue = useCallback(() => {
+    if (!isSpeaking && !messageQueue.isEmpty()) {
+      const nextMessage = messageQueue.peek();
+      if (nextMessage) {
+        speakMessage(nextMessage);
+      }
     }
-}
+  }, [isSpeaking, messageQueue, speakMessage]);
 
-export const TTSServer = () => {
-    const [messages, setMessages] = useState<TTSMessage[]>([]);
-    const [fadingOut, setFadingOut] = useState<number[]>([]);
+  // Monitor queue and process messages
+  useEffect(() => {
+    const interval = setInterval(processQueue, 100);
+    return () => clearInterval(interval);
+  }, [processQueue]);
 
-    useEffect(() => {
-        console.log('Attempting to connect to WebSocket server...');
-        const ws = new WebSocket('ws://localhost:8080');
+  const initializeConnection = useCallback(() => {
+    setIsInitialized(true);
+  }, []);
 
-        ws.onopen = () => {
-            console.log('Successfully connected to WebSocket server');
-        };
+  useEffect(() => {
+    if (!isInitialized) return;
 
-        ws.onerror = (error) => {
-            console.error('WebSocket error:', error);
-        };
+    const ws = new WebSocket("ws://localhost:8080/ws/listen");
 
-        ws.onmessage = async (event) => {
-            try {
-                const message: TTSMessage = {
-                    ...JSON.parse(event.data),
-                    id: Date.now()
-                };
-                setMessages((prev) => [...prev, message]);
+    ws.onopen = () => {
+      console.log("WebSocket Connected");
+      setWsConnected(true);
+      const welcomeMessage: Message = {
+        name: "System",
+        amount: 0,
+        message: "Connected to TTS server"
+      };
+      messageQueue.enqueue(welcomeMessage);
+    };
 
-                // Stream and play the TTS audio
-                await streamAudio(message.message);
+    ws.onmessage = (event) => {
+      try {
+        const message: Message = JSON.parse(event.data);
+        messageQueue.enqueue(message);
+      } catch (err) {
+        console.error("Error parsing WebSocket message:", err);
+      }
+    };
 
-                setTimeout(() => {
-                    setFadingOut((prev) => [...prev, message.id]);
-                }, 4500);
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+      setError("WebSocket connection error");
+    };
 
-                setTimeout(() => {
-                    setMessages((prev) => prev.filter((m) => m.id !== message.id));
-                    setFadingOut((prev) => prev.filter((id) => id !== message.id));
-                }, 5000);
-            } catch (error) {
-                console.error('Error parsing TTS message:', error);
-            }
-        };
+    ws.onclose = () => {
+      console.log("WebSocket Disconnected");
+      setWsConnected(false);
+      const disconnectMessage: Message = {
+        name: "System",
+        amount: 0,
+        message: "Disconnected from TTS server"
+      };
+      messageQueue.enqueue(disconnectMessage);
+    };
 
-        ws.onclose = () => {
-            console.log('Disconnected from WebSocket server');
-        };
+    return () => {
+      ws.close();
+      window.speechSynthesis.cancel();
+    };
+  }, [isInitialized, messageQueue]);
 
-        return () => {
-            ws.close();
-        };
-    }, []);
+  return (
+    <div className="messages-container">
+      {!isInitialized ? (
+        <button className="start-button" onClick={initializeConnection}>
+          Start TTS
+        </button>
+      ) : (
+        <>
+          <div className="connection-status">
+            WebSocket Status: {wsConnected ? "Connected" : "Disconnected"}
+          </div>
 
-    return (
-        <div className="tts-container">
-            {messages.map((msg) => (
-                <div
-                    key={msg.id}
-                    className={`tts-message ${fadingOut.includes(msg.id) ? 'fade-out' : ''}`}
-                >
-                    <div className="tts-name">
-                        {msg.name} <span className="tts-amount">donated {formatAmount(msg.amount)}</span>
-                    </div>
-                    <div className="tts-text">{msg.message}</div>
-                </div>
-            ))}
-        </div>
-    );
+          {error && <div className="error-message">{error}</div>}
+
+          {displayMessage && (
+            <div className="messages-list">
+              <div className="message-item">
+                <pre>{JSON.stringify(displayMessage, null, 2)}</pre>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 };
 
 export default TTSServer;
